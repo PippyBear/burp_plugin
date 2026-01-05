@@ -6,6 +6,8 @@ from javax.swing import (
     BoxLayout, JMenuItem, JPopupMenu, JOptionPane,
     JList, DefaultListModel
 )
+from javax.swing.table import DefaultTableCellRenderer
+from java.awt import Color
 from java.awt import FlowLayout
 from javax.swing.table import AbstractTableModel
 from java.util import ArrayList
@@ -31,6 +33,27 @@ class TableMouseListener(MouseAdapter):
         if event.isPopupTrigger():
             self.popup.show(event.getComponent(), event.getX(), event.getY())
 
+class StatusColorRenderer(DefaultTableCellRenderer):
+    def getTableCellRendererComponent(self, table, value, isSelected, hasFocus, row, col):
+        c = super(StatusColorRenderer, self).getTableCellRendererComponent(
+            table, value, isSelected, hasFocus, row, col
+        )
+
+        if isSelected:
+            return c   # 让系统处理选中颜色
+
+        status = table.getValueAt(row, 3)
+
+        if status == "Triggered":
+            c.setBackground(Color(255, 200, 200))
+        elif status == "Not Triggered":
+            c.setBackground(Color(220, 220, 220))
+        elif status == "Reflected":
+            c.setBackground(Color(255, 230, 200))
+        else:
+            c.setBackground(Color.white)
+
+        return c
 
 class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
 
@@ -116,6 +139,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
         self.popup = JPopupMenu()
         self.popup.add(JMenuItem("Clear Records", actionPerformed=lambda e: self.clearRecords()))
         self.table.addMouseListener(TableMouseListener(self.popup))
+        renderer = StatusColorRenderer()
+        for i in range(self.table.getColumnCount()):
+            self.table.getColumnModel().getColumn(i).setCellRenderer(renderer)
+
 
     def toggleProxy(self):
         self.proxy_enabled = self.proxyCheckbox.isSelected()
@@ -235,22 +262,42 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
                 collab_id = self.collaborator.generatePayload(True)
                 collab_url = "http://" + collab_id
 
+                self.collab_mapping[collab_url] = url.toString() if url else "N/A"
+                self.start_times[collab_url] = time.time()
+
+                self.updateOrAddRow([
+                    url.toString() if url else "N/A",
+                    collab_url,
+                    "Waiting",
+                    "Waiting"
+                ])
+
+                # ===== 判断是否 JSON（必须在 updateParameter 之前）=====
+                headers = analyzed.getHeaders()
+                is_json = any("application/json" in h.lower() for h in headers)
+
                 param_names = ["url", "redirect", "target", "next", "returnurl", "callback"]
                 new_request = request
 
-                for p in analyzed.getParameters():
-                    if p.getName().lower() in param_names:
-                        new_param = self.helpers.buildParameter(
-                            p.getName(), collab_url, p.getType()
-                        )
-                        new_request = self.helpers.updateParameter(new_request, new_param)
+                # ===== 非 JSON：才允许 updateParameter =====
+                if not is_json:
+                    for p in analyzed.getParameters():
+                        if p.getName().lower() in param_names:
+                            new_param = self.helpers.buildParameter(
+                                p.getName(), collab_url, p.getType()
+                            )
+                            new_request = self.helpers.updateParameter(new_request, new_param)
 
+                # ===== 重新解析 request =====
                 analyzed_new = self.helpers.analyzeRequest(new_request)
+                headers = analyzed_new.getHeaders()
                 body = new_request[analyzed_new.getBodyOffset():]
                 body_str = self.helpers.bytesToString(body)
-                headers = analyzed_new.getHeaders()
 
-                new_body = self.injectPayload(body_str, collab_url)
+                print("[DEBUG body before inject]", repr(body_str))
+
+                # ===== JSON / Form body 注入 =====
+                new_body = self.injectPayload(body_str, collab_url, is_json)
                 new_request = self.helpers.buildHttpMessage(headers, new_body)
 
                 response = self.callbacks.makeHttpRequest(
@@ -263,30 +310,58 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
                 resp_str = self.helpers.bytesToString(resp_body)
 
                 if self.is_ssrf_successful(resp_str):
-                    self.updateOrAddRow([url.toString(), collab_url, "Reflected", "Triggered"])
-                else:
-                    self.collab_mapping[collab_url] = url.toString()
-                    self.start_times[collab_url] = time.time()
-                    self.updateOrAddRow([url.toString(), collab_url, "Waiting", "Waiting"])
+                    self.updateOrAddRow([
+                        url.toString() if url else "N/A",
+                        collab_url,
+                        "Reflected",
+                        "Triggered"
+                    ])
 
             except Exception as e:
                 print("[SSRFDetector] processRequest error:", e)
 
         Thread(target=run).start()
 
-    def injectPayload(self, body, payload):
-        body_str = body
-        for k in ["url", "redirect", "target", "next", "returnurl", "callback"]:
-            body_str = re.sub(r'(?i)(' + k + r')=([^&]+)', r'\1=' + payload, body_str)
 
-        try:
-            j = json.loads(body_str)
-            for k in j:
-                if k.lower() in ["url", "redirect", "target", "next", "returnurl", "callback"]:
-                    j[k] = payload
-            body_str = json.dumps(j)
-        except:
-            pass
+    def deepInjectJson(self, obj, payload):
+        ssrf_keys = ["url", "redirect", "target", "next", "returnurl", "callback"]
+
+        if isinstance(obj, dict):
+            for k in obj:
+                v = obj[k]
+                if k.lower() in ssrf_keys and isinstance(v, str):
+                    obj[k] = payload
+                else:
+                    self.deepInjectJson(v, payload)
+
+        elif isinstance(obj, list):
+            for i in range(len(obj)):
+                self.deepInjectJson(obj[i], payload)
+
+    def injectPayload(self, body, payload, is_json):
+        body_str = body or ""
+
+        # 1️⃣ 表单 / query
+        for k in ["url", "redirect", "target", "next", "returnurl", "callback"]:
+            body_str = re.sub(
+                r'(?i)("?' + k + r'"?\s*:\s*)"[^"]*"',
+                r'\1"' + payload + '"',
+                body_str
+            )
+            body_str = re.sub(
+                r'(?i)(' + k + r')=([^&]+)',
+                r'\1=' + payload,
+                body_str
+            )
+
+        # 2️⃣ JSON 深层
+        if is_json:
+            try:
+                j = json.loads(body_str)
+                self.deepInjectJson(j, payload)
+                body_str = json.dumps(j)
+            except Exception as e:
+                print("[SSRFDetector] JSON inject error:", e)
 
         return self.helpers.stringToBytes(body_str)
 
@@ -297,15 +372,36 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
 
     def _checkCollaborator(self):
         try:
+            now = time.time()
             interactions = self.collaborator.fetchAllCollaboratorInteractions()
+
+            # 1️⃣ 处理已触发
             for data in interactions:
                 pid = data.getProperty("interaction_id").lower()
                 for k in list(self.collab_mapping.keys()):
                     sub = k.replace("http://", "").split(".")[0].lower()
                     if pid == sub:
-                        self.updateOrAddRow([self.collab_mapping[k], k, data.getProperty("protocol"), "Triggered"])
+                        self.updateOrAddRow([
+                            self.collab_mapping[k],
+                            k,
+                            data.getProperty("protocol"),
+                            "Triggered"
+                        ])
                         self.collab_mapping.pop(k, None)
                         self.start_times.pop(k, None)
+
+            # 2️⃣ 处理超时未触发
+            for k in list(self.start_times.keys()):
+                if now - self.start_times[k] > 180:
+                    self.updateOrAddRow([
+                        self.collab_mapping.get(k, "N/A"),
+                        k,
+                        "Timeout",
+                        "Not Triggered"
+                    ])
+                    self.start_times.pop(k, None)
+                    self.collab_mapping.pop(k, None)
+
         except Exception as e:
             print("[SSRFDetector] collaborator error:", e)
 
@@ -317,11 +413,26 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
     def updateOrAddRow(self, row):
         def ui():
             payload = row[1]
+            new_status = row[3]
+
             if payload in self.row_map:
-                self.table_model.data[self.row_map[payload]] = row
+                idx = self.row_map[payload]
+                old_row = self.table_model.data[idx]
+                old_status = old_row[3]
+
+                # ===== 状态防回退 =====
+                if old_status == "Triggered":
+                    return
+                if old_status == "Reflected" and new_status != "Triggered":
+                    return
+                if old_status == "Not Triggered":
+                    return
+
+                self.table_model.data[idx] = row
             else:
                 self.row_map[payload] = len(self.table_model.data)
                 self.table_model.data.append(row)
+
             self.table_model.fireTableDataChanged()
 
         SwingUtilities.invokeLater(ui)
