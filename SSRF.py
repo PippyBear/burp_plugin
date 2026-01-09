@@ -16,6 +16,8 @@ from threading import Thread
 from javax.swing import SwingUtilities
 from java.awt.event import MouseAdapter
 from javax.swing import JCheckBox
+from java.awt import Toolkit
+from java.awt.datatransfer import StringSelection
 import json
 import re
 import time
@@ -27,7 +29,11 @@ class TableMouseListener(MouseAdapter):
 
     def mousePressed(self, event):
         if event.isPopupTrigger():
-            self.popup.show(event.getComponent(), event.getX(), event.getY())
+            table = event.getComponent()
+            row = table.rowAtPoint(event.getPoint())
+            if row >= 0:
+                table.setRowSelectionInterval(row, row)
+            self.popup.show(table, event.getX(), event.getY())
 
     def mouseReleased(self, event):
         if event.isPopupTrigger():
@@ -137,7 +143,24 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
 
         # ===== Table Right Click =====
         self.popup = JPopupMenu()
-        self.popup.add(JMenuItem("Clear Records", actionPerformed=lambda e: self.clearRecords()))
+        self.popup.add(JMenuItem(
+            "Copy Payload",
+            actionPerformed=lambda e: self.copySelectedPayload()
+        ))
+
+        self.popup.addSeparator()
+
+        self.popup.add(JMenuItem(
+            "Send Selected to Repeater",
+            actionPerformed=lambda e: self.sendSelectedToRepeater()
+        ))
+
+        self.popup.addSeparator()
+
+        self.popup.add(JMenuItem(
+            "Clear Records",
+            actionPerformed=lambda e: self.clearRecords()
+        ))
         self.table.addMouseListener(TableMouseListener(self.popup))
         renderer = StatusColorRenderer()
         for i in range(self.table.getColumnCount()):
@@ -247,6 +270,46 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
         except Exception as e:
             print("[SSRFDetector] Proxy auto detect error:", e)
 
+    def sendSelectedToRepeater(self):
+        row = self.table.getSelectedRow()
+        if row < 0:
+            JOptionPane.showMessageDialog(self.panel, "No row selected")
+            return
+
+        payload = self.table_model.data[row][1]
+        entry = self.row_map.get(payload)
+        if not entry:
+            return
+
+        msg = entry.get("message")
+        if not msg:
+            JOptionPane.showMessageDialog(self.panel, "Original request not found")
+            return
+
+        service = msg.getHttpService()
+        self.callbacks.sendToRepeater(
+            service.getHost(),
+            service.getPort(),
+            service.getProtocol().lower() == "https",
+            msg.getRequest(),
+            "SSRF-" + self.table_model.data[row][3]
+        )
+
+    def copySelectedPayload(self):
+        row = self.table.getSelectedRow()
+        if row < 0:
+            JOptionPane.showMessageDialog(self.panel, "No row selected")
+            return
+
+        payload = self.table_model.data[row][1]
+        if not payload:
+            return
+
+        clipboard = Toolkit.getDefaultToolkit().getSystemClipboard()
+        clipboard.setContents(StringSelection(payload), None)
+
+        print("[SSRFDetector] Payload copied:", payload)
+
     # ================= 核心 SSRF 逻辑（原样） =================
 
     def is_ssrf_successful(self, response_text):
@@ -265,12 +328,15 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
                 self.collab_mapping[collab_url] = url.toString() if url else "N/A"
                 self.start_times[collab_url] = time.time()
 
-                self.updateOrAddRow([
-                    url.toString() if url else "N/A",
-                    collab_url,
-                    "Waiting",
-                    "Waiting"
-                ])
+                self.updateOrAddRow(
+                    [
+                        url.toString() if url else "N/A",
+                        collab_url,
+                        "Waiting",
+                        "Waiting"
+                    ],
+                    message   # 👈 关键
+                )
 
                 # ===== 判断是否 JSON（必须在 updateParameter 之前）=====
                 headers = analyzed.getHeaders()
@@ -410,13 +476,13 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
             self._checkCollaborator()
             time.sleep(30)
 
-    def updateOrAddRow(self, row):
+    def updateOrAddRow(self, row, messageInfo=None):
         def ui():
             payload = row[1]
             new_status = row[3]
 
             if payload in self.row_map:
-                idx = self.row_map[payload]
+                idx = self.row_map[payload]["index"]
                 old_row = self.table_model.data[idx]
                 old_status = old_row[3]
 
@@ -430,7 +496,10 @@ class BurpExtender(IBurpExtender, ITab, IHttpListener, IContextMenuFactory):
 
                 self.table_model.data[idx] = row
             else:
-                self.row_map[payload] = len(self.table_model.data)
+                self.row_map[payload] = {
+                    "index": len(self.table_model.data),
+                    "message": messageInfo
+                }
                 self.table_model.data.append(row)
 
             self.table_model.fireTableDataChanged()
